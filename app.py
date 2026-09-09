@@ -290,11 +290,8 @@ st.markdown(
 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1.5rem; padding-bottom:1rem; border-bottom:1px solid rgba(255,255,255,0.08);">
     <div>
         <h1 style="font-size:2rem; font-weight:800; letter-spacing:-0.5px; margin:0; color:#ffffff;">
-            ⚡ RSS Feed & Live GitHub Publisher
+            ⚡ RSS Feed
         </h1>
-        <p style="color:#94a3b8; font-size:0.9rem; margin-top:0.3rem; margin-bottom:0;">
-            Deep crawl news listings, enrich article metadata, and automatically host unique live feeds on GitHub Pages.
-        </p>
     </div>
 </div>
 """,
