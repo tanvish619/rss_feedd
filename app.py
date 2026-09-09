@@ -1,8 +1,9 @@
 """
-app.py — RSS & Feed Generator
+app.py — RSS & Feed Generator with Automated GitHub Pages Hosting
 
-Crawl any listing URL heuristically, extract articles, filter by keywords,
-and export as JSON, HTML Reader, or RSS 2.0 XML.
+Crawls listing pages heuristically, extracts rich article metadata and body HTML,
+generates RFC-compliant RSS 2.0 XML with CDATA encapsulation, and automatically
+publishes live to GitHub Pages via PyGithub with unique permalinks.
 """
 
 from __future__ import annotations
@@ -10,14 +11,21 @@ from __future__ import annotations
 import base64
 import logging
 import os
+import re
 import time
+from datetime import datetime, timezone
 from typing import Optional
 from urllib.parse import urlparse
 
 import requests
 import streamlit as st
+from dotenv import load_dotenv
+
+# Load local .env file
+load_dotenv()
 
 from rss.builder import build_feed, build_html_feed, build_json_feed
+from rss.publisher import publish_to_github
 from rss.validator import get_feed_summary, validate_feed
 from scraper.crawler import crawl
 from scraper.extractor import apply_keyword_filter
@@ -35,7 +43,7 @@ os.makedirs(EXPORTS_DIR, exist_ok=True)
 
 # ── Page Config ───────────────────────────────────────────────────────────────
 st.set_page_config(
-    page_title="Feed Engine · Crawl & Export",
+    page_title="Feed Engine · Crawl & GitHub Pages Publisher",
     page_icon="⚡",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -65,6 +73,32 @@ h1, h2, h3, .brand-font {
     color: #f1f5f9;
 }
 
+/* GitHub Pages Live Banner Card */
+.github-live-card {
+    background: linear-gradient(135deg, rgba(16, 185, 129, 0.12) 0%, rgba(99, 102, 241, 0.1) 100%);
+    border: 1px solid rgba(52, 211, 153, 0.35);
+    border-radius: 16px;
+    padding: 1.5rem 1.8rem;
+    margin-bottom: 1.5rem;
+    box-shadow: 0 8px 32px rgba(16, 185, 129, 0.15);
+}
+
+.github-live-url {
+    background: rgba(15, 23, 42, 0.85);
+    border: 1px solid rgba(52, 211, 153, 0.3);
+    border-radius: 10px;
+    padding: 0.75rem 1.25rem;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 1.05rem;
+    color: #34d399;
+    word-break: break-all;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-top: 0.8rem;
+    gap: 1rem;
+}
+
 /* Download Format Cards */
 .download-card {
     background: rgba(18, 22, 38, 0.7);
@@ -80,26 +114,6 @@ h1, h2, h3, .brand-font {
     border-color: rgba(99, 102, 241, 0.5);
     transform: translateY(-2px);
     box-shadow: 0 8px 30px -4px rgba(99, 102, 241, 0.25);
-}
-
-/* Direct HTML download link button */
-.direct-download-btn {
-    display: inline-block;
-    width: 100%;
-    text-align: center;
-    background: linear-gradient(135deg, #6366f1 0%, #4f46e5 100%);
-    color: #ffffff !important;
-    text-decoration: none !important;
-    font-weight: 600;
-    font-size: 0.92rem;
-    padding: 0.65rem 1.2rem;
-    border-radius: 10px;
-    box-shadow: 0 4px 14px rgba(99, 102, 241, 0.35);
-    transition: all 0.2s ease;
-}
-.direct-download-btn:hover {
-    transform: translateY(-1px);
-    box-shadow: 0 6px 20px rgba(99, 102, 241, 0.55);
 }
 
 /* Article Card */
@@ -192,6 +206,10 @@ def _init_state() -> None:
         "log_messages": [],
         "crawl_error": None,
         "exports_saved": False,
+        "github_published": False,
+        "github_pages_url": None,
+        "github_error": None,
+        "feed_file_name": "feed.xml",
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -202,6 +220,31 @@ _init_state()
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
+def _get_secret(key: str, default: str = "") -> str:
+    """Safely get a secret from environment (.env), Streamlit secrets, or return default."""
+    env_val = os.getenv(key)
+    if env_val and env_val.strip() and not env_val.startswith("your_"):
+        return env_val.strip()
+    try:
+        if key in st.secrets:
+            return str(st.secrets[key]).strip()
+    except Exception:
+        pass
+    return default
+
+
+def _generate_unique_feed_path(source_url: str, ext: str = "xml") -> str:
+    """Generate a unique file path for each crawl, e.g. feeds/domain_YYYYMMDD_HHMMSS.xml"""
+    parsed = urlparse(source_url)
+    domain = parsed.netloc.lower()
+    domain = re.sub(r"^www\.", "", domain)
+    domain_clean = re.sub(r"[^a-zA-Z0-9]+", "_", domain).strip("_")
+    if not domain_clean:
+        domain_clean = "news"
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    return f"feeds/{domain_clean}_{ts}.{ext}"
+
+
 def _validate_url(url: str) -> Optional[str]:
     url = url.strip()
     if not url:
@@ -247,17 +290,20 @@ st.markdown(
 <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1.5rem; padding-bottom:1rem; border-bottom:1px solid rgba(255,255,255,0.08);">
     <div>
         <h1 style="font-size:2rem; font-weight:800; letter-spacing:-0.5px; margin:0; color:#ffffff;">
-            ⚡ RSS Feed
+            ⚡ RSS Feed & Live GitHub Publisher
         </h1>
+        <p style="color:#94a3b8; font-size:0.9rem; margin-top:0.3rem; margin-bottom:0;">
+            Deep crawl news listings, enrich article metadata, and automatically host unique live feeds on GitHub Pages.
+        </p>
     </div>
 </div>
 """,
     unsafe_allow_html=True,
 )
 
-# Search & Configuration Console
+# Main Search & Execution Bar
 with st.container():
-    col_input, col_kw, col_btn = st.columns([4, 2, 1.2])
+    col_input, col_kw, col_btn = st.columns([4, 2, 1.6])
 
     with col_input:
         target_url = st.text_input(
@@ -277,19 +323,19 @@ with st.container():
 
     with col_btn:
         start_crawl = st.button(
-            "⚡ Extract Feed",
+            "⚡ Generate & Publish RSS Feed",
             type="primary",
             use_container_width=True,
             key="start_crawl_btn",
         )
 
-    # Collapsible Crawler Settings
+    # Clean Crawler Options
     with st.expander("⚙️ Crawler Options (Max Pages, Limit, Match Mode)", expanded=False):
         c_opt1, c_opt2, c_opt3, c_opt4 = st.columns(4)
         with c_opt1:
-            max_pages = st.number_input("Max Pages", min_value=1, max_value=100, value=10, step=1)
+            max_pages = st.number_input("Max Listing Pages", min_value=1, max_value=100, value=5, step=1)
         with c_opt2:
-            max_articles = st.number_input("Max Items", min_value=5, max_value=1000, value=250, step=25)
+            max_articles = st.number_input("Max Articles Limit", min_value=1, max_value=500, value=50, step=10)
         with c_opt3:
             match_mode = st.selectbox("Keyword Matching", ["Any keyword", "All keywords"])
         with c_opt4:
@@ -311,6 +357,10 @@ if start_crawl:
             "log_messages": [],
             "crawl_error": None,
             "exports_saved": False,
+            "github_published": False,
+            "github_pages_url": None,
+            "github_error": None,
+            "feed_file_name": "feed.xml",
         }
     )
 
@@ -338,7 +388,7 @@ if start_crawl:
 
     # Progress HUD
     st.markdown("<br>", unsafe_allow_html=True)
-    hud_prog = st.progress(0.0, text="Initializing crawl engine…")
+    hud_prog = st.progress(0.0, text="Initializing crawl & extraction engine…")
     hud_status = st.empty()
     hud_metrics = st.empty()
 
@@ -346,41 +396,43 @@ if start_crawl:
     last_stats: Optional[CrawlStats] = None
     log_messages: list[str] = []
 
-    try:
-        for new_articles, stats, message in crawl(
-            start_url=url,
-            max_pages=int(max_pages),
-            max_articles=int(max_articles),
-            timeout=15.0,
-            delay=float(crawl_delay),
-            session=session,
-        ):
-            if not stats.robots_allowed:
-                st.error("🚫 Access blocked by site's robots.txt policy.")
-                st.stop()
+    with st.spinner("Crawling listing, extracting articles, building RSS feed, and publishing to GitHub Pages..."):
+        try:
+            for new_articles, stats, message in crawl(
+                start_url=url,
+                max_pages=int(max_pages),
+                max_articles=int(max_articles),
+                timeout=15.0,
+                delay=float(crawl_delay),
+                session=session,
+                enrich_details=True,
+            ):
+                if not stats.robots_allowed:
+                    st.error("🚫 Access blocked by site's robots.txt policy.")
+                    st.stop()
 
-            collected_articles.extend(new_articles)
-            last_stats = stats
-            log_messages.append(message)
+                collected_articles.extend(new_articles)
+                last_stats = stats
+                log_messages.append(message)
 
-            hud_status.markdown(f"`{message}`")
+                hud_status.markdown(f"`{message}`")
 
-            if stats.pages_discovered > 0:
-                prog = min(stats.pages_crawled / max(stats.pages_discovered, 1), 1.0)
-                hud_prog.progress(prog, text=f"Crawling page {stats.pages_crawled} of {stats.pages_discovered}…")
+                if stats.pages_discovered > 0:
+                    prog = min(stats.pages_crawled / max(stats.pages_discovered, 1), 1.0)
+                    hud_prog.progress(prog, text=f"Processing page {stats.pages_crawled} of {stats.pages_discovered}…")
 
-            with hud_metrics.container():
-                m1, m2, m3, m4 = st.columns(4)
-                m1.metric("Pages Visited", stats.pages_crawled)
-                m2.metric("Raw Found", stats.articles_found)
-                m3.metric("Unique Items", len(collected_articles))
-                m4.metric("Dupes Merged", stats.duplicates_removed)
+                with hud_metrics.container():
+                    m1, m2, m3, m4 = st.columns(4)
+                    m1.metric("Pages Visited", stats.pages_crawled)
+                    m2.metric("Raw Found", stats.articles_found)
+                    m3.metric("Unique Items", len(collected_articles))
+                    m4.metric("Dupes Merged", stats.duplicates_removed)
 
-        hud_prog.progress(1.0, text="Done!")
+            hud_prog.progress(1.0, text="Crawl & Enrichment Complete!")
 
-    except Exception as exc:
-        st.session_state["crawl_error"] = str(exc)
-        logger.exception("Crawl error")
+        except Exception as exc:
+            st.session_state["crawl_error"] = str(exc)
+            logger.exception("Crawl error")
 
     # Deduplicate
     seen_urls: set[str] = set()
@@ -408,9 +460,15 @@ if start_crawl:
             feed_json = build_json_feed(final_articles, url)
             feed_html = build_html_feed(final_articles, url)
 
+            # Generate a unique file path for this crawl
+            unique_rel_path = _generate_unique_feed_path(url, "xml")
+            st.session_state["feed_file_name"] = os.path.basename(unique_rel_path)
+
             # Auto-save directly to local disk in exports/ folder
             try:
                 with open(os.path.join(EXPORTS_DIR, "feed.xml"), "w", encoding="utf-8") as f:
+                    f.write(feed_xml)
+                with open(os.path.join(EXPORTS_DIR, os.path.basename(unique_rel_path)), "w", encoding="utf-8") as f:
                     f.write(feed_xml)
                 with open(os.path.join(EXPORTS_DIR, "feed.json"), "w", encoding="utf-8") as f:
                     f.write(feed_json)
@@ -426,6 +484,32 @@ if start_crawl:
             st.session_state["feed_html"] = feed_html
             st.session_state["feed_valid"] = valid
             st.session_state["feed_error"] = feed_err
+
+            # ── Automated GitHub Pages Publishing (Reads credentials from .env) ─
+            token_to_use = _get_secret("GITHUB_TOKEN", "")
+            repo_to_use = _get_secret("GITHUB_REPO", "tanvish619/rss_feedd")
+            branch_to_use = _get_secret("GITHUB_BRANCH", "main")
+
+            if token_to_use and repo_to_use:
+                hud_status.markdown(f"🚀 `Publishing {unique_rel_path} to GitHub Pages ({repo_to_use})…`")
+                published, pages_url, gh_err = publish_to_github(
+                    xml_content=feed_xml,
+                    repo_name=repo_to_use,
+                    file_path=unique_rel_path,
+                    token=token_to_use,
+                    branch=branch_to_use,
+                )
+                st.session_state["github_published"] = published
+                st.session_state["github_pages_url"] = pages_url
+                st.session_state["github_error"] = gh_err
+            else:
+                st.session_state["github_published"] = False
+                st.session_state["github_pages_url"] = None
+                st.session_state["github_error"] = (
+                    "GITHUB_TOKEN is missing in .env file. "
+                    "Feed generated locally. Add GITHUB_TOKEN to .env to enable automatic live hosting."
+                )
+
         except Exception as exc:
             st.session_state["feed_error"] = str(exc)
             logger.exception("Feed generation failed")
@@ -450,6 +534,11 @@ if st.session_state.get("crawl_done"):
     feed_error: Optional[str] = st.session_state.get("feed_error")
     crawl_error: Optional[str] = st.session_state.get("crawl_error")
     log_messages: list[str] = st.session_state.get("log_messages", [])
+    feed_file_name: str = st.session_state.get("feed_file_name", "feed.xml")
+
+    gh_published: bool = st.session_state.get("github_published", False)
+    gh_pages_url: Optional[str] = st.session_state.get("github_pages_url")
+    gh_error: Optional[str] = st.session_state.get("github_error")
 
     if crawl_error:
         st.error(f"Crawl error: {crawl_error}")
@@ -460,13 +549,42 @@ if st.session_state.get("crawl_done"):
 
     st.markdown("<br>", unsafe_allow_html=True)
 
+    # ── Live GitHub Pages Success Banner ──────────────────────────────────────
+    if gh_published and gh_pages_url:
+        st.markdown(
+            f"""
+<div class="github-live-card">
+    <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:0.5rem;">
+        <div>
+            <span class="tag-pill" style="background:rgba(52,211,153,0.2); color:#34d399; border:1px solid rgba(52,211,153,0.4); margin-bottom:0.4rem;">
+                🚀 LIVE PERMANENT FEED ON GITHUB PAGES
+            </span>
+            <h3 style="font-size:1.45rem; font-weight:800; color:#ffffff; margin:0.3rem 0 0.2rem 0;">
+                🎉 RSS Feed Published Successfully!
+            </h3>
+            <p style="color:#cbd5e1; font-size:0.92rem; margin:0;">
+                Unique public URL generated and hosted. Copy or open this link in Feedly, NetNewsWire, Apple News, or any RSS app:
+            </p>
+        </div>
+    </div>
+    <div class="github-live-url">
+        <span>🔗 <a href="{gh_pages_url}" target="_blank" rel="noopener" style="color:#34d399; text-decoration:none; font-weight:600;">{gh_pages_url}</a></span>
+        <a href="{gh_pages_url}" target="_blank" rel="noopener" style="background:#10b981; color:#ffffff; padding:6px 16px; border-radius:6px; text-decoration:none; font-size:0.88rem; font-weight:600; white-space:nowrap;">Open Feed ↗</a>
+    </div>
+</div>
+""",
+            unsafe_allow_html=True,
+        )
+    elif gh_error:
+        st.info(f"ℹ️ **GitHub Hosting Note**: {gh_error}")
+
     # ── 3-Format Download Center ──────────────────────────────────────────────
     st.markdown(
         f"""
 <div style="display:flex; justify-content:space-between; align-items:flex-end; margin-bottom:1rem; flex-wrap:wrap; gap:0.5rem;">
     <div>
         <h3 style="font-size:1.35rem; font-weight:700; color:#ffffff; margin:0;">
-            📥 Export & Download Feed
+            📥 Export & Download Feed Files
         </h3>
         <p style="color:#94a3b8; font-size:0.88rem; margin-top:0.2rem; margin-bottom:0;">
             Direct instant downloads · Also saved locally to: <code style="color:#818cf8; background:rgba(255,255,255,0.06); padding:2px 6px; border-radius:4px;">{EXPORTS_DIR}</code>
@@ -505,7 +623,6 @@ if st.session_state.get("crawl_done"):
                 type="primary",
                 key="dl_json_btn",
             )
-            # Direct client-side HTML download link as guaranteed fallback
             json_uri = _make_data_uri(feed_json, "application/json")
             st.markdown(
                 f'<a href="{json_uri}" download="feed.json" style="color:#38bdf8; font-size:0.8rem; text-decoration:none; display:block; text-align:center; margin-top:4px;">Direct Browser Link (feed.json) ↗</a>',
@@ -538,7 +655,6 @@ if st.session_state.get("crawl_done"):
                 type="primary",
                 key="dl_html_btn",
             )
-            # Direct client-side HTML download link as guaranteed fallback
             html_uri = _make_data_uri(feed_html, "text/html")
             st.markdown(
                 f'<a href="{html_uri}" download="feed.html" style="color:#34d399; font-size:0.8rem; text-decoration:none; display:block; text-align:center; margin-top:4px;">Direct Browser Link (feed.html) ↗</a>',
@@ -552,10 +668,10 @@ if st.session_state.get("crawl_done"):
 <div class="download-card">
     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:0.5rem;">
         <span style="font-weight:700; color:#a5b4fc; font-size:1.05rem;">📡 RSS 2.0 XML</span>
-        <span class="tag-pill" style="background:rgba(165,180,252,0.15); color:#a5b4fc; border:1px solid rgba(165,180,252,0.3);">feed.xml</span>
+        <span class="tag-pill" style="background:rgba(165,180,252,0.15); color:#a5b4fc; border:1px solid rgba(165,180,252,0.3);">{feed_file_name}</span>
     </div>
     <p style="color:#94a3b8; font-size:0.84rem; margin-bottom:1rem; line-height:1.4;">
-        RFC-compliant RSS 2.0 XML. Works with Feedly, NetNewsWire, RSS reader apps, or Notepad.
+        RFC-compliant RSS 2.0 XML with CDATA & content:encoded. Works in any RSS reader.
     </p>
 </div>
 """,
@@ -563,18 +679,17 @@ if st.session_state.get("crawl_done"):
         )
         if feed_xml:
             st.download_button(
-                label="⬇️ Download feed.xml",
+                label=f"⬇️ Download {feed_file_name}",
                 data=feed_xml,
-                file_name="feed.xml",
+                file_name=feed_file_name,
                 mime="application/rss+xml",
                 use_container_width=True,
                 type="primary",
                 key="dl_xml_btn",
             )
-            # Direct client-side HTML download link as guaranteed fallback
             xml_uri = _make_data_uri(feed_xml, "application/rss+xml")
             st.markdown(
-                f'<a href="{xml_uri}" download="feed.xml" style="color:#a5b4fc; font-size:0.8rem; text-decoration:none; display:block; text-align:center; margin-top:4px;">Direct Browser Link (feed.xml) ↗</a>',
+                f'<a href="{xml_uri}" download="{feed_file_name}" style="color:#a5b4fc; font-size:0.8rem; text-decoration:none; display:block; text-align:center; margin-top:4px;">Direct Browser Link ({feed_file_name}) ↗</a>',
                 unsafe_allow_html=True,
             )
 
@@ -704,7 +819,7 @@ if st.session_state.get("crawl_done"):
 
     with tab_xml_view:
         if feed_xml:
-            st.markdown("#### 📡 RSS 2.0 XML")
+            st.markdown("#### 📡 RSS 2.0 XML (with CDATA & content:encoded)")
             st.code(feed_xml, language="xml")
 
     with tab_logs:
@@ -720,7 +835,7 @@ if st.session_state.get("crawl_done"):
 st.markdown("---")
 st.markdown(
     "<div style='text-align:center; color:#475569; font-size:0.8rem; padding:1.5rem 0;'>"
-    "Feed Engine · Crawls server-rendered pages · Complies with RFC RSS 2.0 & JSON Feed v1.1"
+    "Feed Engine · Crawls server-rendered pages · Complies with RFC RSS 2.0 & JSON Feed v1.1 · Automated GitHub Hosting"
     "</div>",
     unsafe_allow_html=True,
 )
